@@ -1,0 +1,6 @@
+{
+  "name": "Quiz Battle Arena",
+  "description": "Multiplayer live quiz battle arena web application",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
