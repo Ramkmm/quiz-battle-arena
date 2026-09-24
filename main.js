@@ -8,6 +8,11 @@ import {
   onValue as fbOnValue,
   onDisconnect as fbOnDisconnect
 } from 'firebase/database';
+import {
+  getAuth,
+  signInAnonymously,
+  onAuthStateChanged
+} from 'firebase/auth';
 
 // -------------------------------------------------------------
 // 1. Firebase Web Configuration
@@ -22,24 +27,51 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID || ''
 };
 
+// Check if a configuration value is missing or a placeholder/template string
+function isConfigPlaceholder(val) {
+  if (!val || typeof val !== 'string') return true;
+  const s = val.trim().toLowerCase();
+  return (
+    s === '' ||
+    s === 'your_api_key' ||
+    s === 'your_project_id' ||
+    s === 'your_app_id' ||
+    s === 'your_sender_id' ||
+    s.includes('your_') ||
+    s.includes('placeholder') ||
+    s.includes('example.com')
+  );
+}
+
 // Required for Firebase Realtime Database
-const hasFirebase = Boolean(
+const isFirebaseConfigured = Boolean(
   firebaseConfig.apiKey &&
+  !isConfigPlaceholder(firebaseConfig.apiKey) &&
   firebaseConfig.databaseURL &&
-  firebaseConfig.projectId
+  !isConfigPlaceholder(firebaseConfig.databaseURL) &&
+  firebaseConfig.projectId &&
+  !isConfigPlaceholder(firebaseConfig.projectId)
 );
 
+let hasFirebase = isFirebaseConfigured;
+
+let firebaseApp = null;
 let db = null;
+let auth = null;
 let firebaseInitError = null;
 let isConnected = false;
 
 if (hasFirebase) {
   try {
-    const app = initializeApp(firebaseConfig);
-    db = getDatabase(app);
+    firebaseApp = initializeApp(firebaseConfig);
+    db = getDatabase(firebaseApp);
+    auth = getAuth(firebaseApp);
   } catch (err) {
-    console.error('Firebase initialization error:', err);
+    console.warn('Firebase initialization notice (using local fallback mode):', err?.message || err);
     firebaseInitError = err.message;
+    hasFirebase = false;
+    db = null;
+    auth = null;
   }
 }
 
@@ -259,6 +291,106 @@ let playerId = session?.playerId || (typeof crypto !== 'undefined' && crypto.ran
 let playerName = session?.name || '';
 let unsubscribe = null;
 
+function updateStoredPlayerId(newId) {
+  playerId = newId;
+  const s = getStoredSession() || {};
+  s.playerId = newId;
+  if (room) s.room = room;
+  if (playerName) s.name = playerName;
+  saveStoredSession(s);
+}
+
+// -------------------------------------------------------------
+// Firebase Anonymous Authentication Setup
+// -------------------------------------------------------------
+let authUser = null;
+let authError = null;
+let isAuthReady = !hasFirebase; // Local fallback is immediately ready
+let authReadyPromise = null;
+
+function switchToLocalFallback(reason) {
+  console.warn('Switching to local development multiplayer mode:', reason);
+  hasFirebase = false;
+  db = { isMock: true };
+  auth = null;
+  authUser = null;
+  authError = null;
+  isAuthReady = true;
+  isConnected = false;
+  updateStatusBadge();
+  updateAuthButtonsState();
+}
+
+if (hasFirebase && auth) {
+  authReadyPromise = new Promise((resolve) => {
+    let resolved = false;
+
+    const onUserReady = (user) => {
+      authUser = user;
+      updateStoredPlayerId(user.uid);
+      isAuthReady = true;
+      authError = null;
+      updateStatusBadge();
+      updateAuthButtonsState();
+      if (!resolved) {
+        resolved = true;
+        resolve(user);
+      }
+    };
+
+    onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        onUserReady(user);
+      } else {
+        // App started or signed out: automatically sign in anonymously with Firebase
+        try {
+          const cred = await signInAnonymously(auth);
+          onUserReady(cred.user);
+        } catch (err) {
+          console.warn('Firebase Anonymous Auth notice (activating local fallback):', err?.message || err);
+          switchToLocalFallback(err?.message);
+          if (!resolved) {
+            resolved = true;
+            resolve(null);
+          }
+        }
+      }
+    });
+  });
+} else {
+  isAuthReady = true;
+  authReadyPromise = Promise.resolve(null);
+}
+
+async function ensureAuth() {
+  if (!hasFirebase) return true;
+  if (isAuthReady && authUser) return true;
+
+  if (authReadyPromise) {
+    await authReadyPromise;
+  }
+
+  if (authUser || !hasFirebase) return true;
+
+  if (auth) {
+    try {
+      const cred = await signInAnonymously(auth);
+      authUser = cred.user;
+      updateStoredPlayerId(cred.user.uid);
+      isAuthReady = true;
+      authError = null;
+      updateStatusBadge();
+      updateAuthButtonsState();
+      return true;
+    } catch (err) {
+      console.warn('Firebase Anonymous Auth sign-in failed (activating local fallback):', err?.message || err);
+      switchToLocalFallback(err?.message);
+      return true;
+    }
+  }
+  return true;
+}
+
 // Submission lock to prevent duplicate answers & race conditions
 let isAnswering = false;
 let selectedChoice = null;
@@ -278,12 +410,18 @@ function updateStatusBadge() {
   if (!badge) return;
 
   if (hasFirebase) {
-    if (isConnected) {
+    if (authError) {
+      badge.className = 'status-pill offline';
+      badge.innerHTML = '<span class="status-dot"></span> Auth Error';
+    } else if (!isAuthReady) {
+      badge.className = 'status-pill offline';
+      badge.innerHTML = '<span class="status-dot"></span> Authenticating...';
+    } else if (isConnected) {
       badge.className = 'status-pill online';
-      badge.innerHTML = '<span class="status-dot"></span> Firebase RTDB Live';
+      badge.innerHTML = `<span class="status-dot"></span> Firebase Live <span class="uid-tag" title="Authenticated UID: ${esc(playerId)}">UID: ${esc(playerId.slice(0, 6))}…</span>`;
     } else {
       badge.className = 'status-pill offline';
-      badge.innerHTML = '<span class="status-dot"></span> Connecting...';
+      badge.innerHTML = '<span class="status-dot"></span> Connecting RTDB...';
     }
   } else {
     badge.className = 'status-pill local';
@@ -291,15 +429,77 @@ function updateStatusBadge() {
   }
 }
 
+function updateAuthButtonsState() {
+  const btnCreate = document.querySelector('#btn-create');
+  const btnJoin = document.querySelector('#btn-join');
+  const authInfo = document.querySelector('#auth-indicator');
+
+  if (authInfo && hasFirebase) {
+    if (authError) {
+      authInfo.className = 'auth-status-bar error';
+      authInfo.innerHTML = `⚠️ Anonymous Auth Failed: ${esc(authError)} <button id="btn-auth-retry" type="button" class="retry-link">Retry</button>`;
+      const retryBtn = document.querySelector('#btn-auth-retry');
+      if (retryBtn) retryBtn.onclick = () => ensureAuth();
+    } else if (!isAuthReady) {
+      authInfo.className = 'auth-status-bar pending';
+      authInfo.innerHTML = '🔒 Authenticating player anonymously with Firebase...';
+    } else if (authUser) {
+      authInfo.className = 'auth-status-bar ready';
+      authInfo.innerHTML = `✓ Authenticated anonymously as <span class="uid-code" title="${esc(playerId)}">UID: ${esc(playerId.slice(0, 8))}…</span>`;
+    }
+  }
+
+  if (hasFirebase) {
+    if (btnCreate) {
+      if (!isAuthReady) {
+        btnCreate.disabled = true;
+        btnCreate.textContent = '⏳ Authenticating...';
+      } else {
+        btnCreate.disabled = false;
+        btnCreate.textContent = '⚡ Create Room';
+      }
+    }
+    if (btnJoin) {
+      btnJoin.disabled = !isAuthReady;
+    }
+  } else {
+    if (btnCreate) {
+      btnCreate.disabled = false;
+      btnCreate.textContent = '⚡ Create Room';
+    }
+    if (btnJoin) {
+      btnJoin.disabled = false;
+    }
+  }
+}
+
 function shell() {
+  let statusClass = 'local';
+  let statusText = 'Local Mode (Dev)';
+  if (hasFirebase) {
+    if (authError) {
+      statusClass = 'offline';
+      statusText = 'Auth Error';
+    } else if (!isAuthReady) {
+      statusClass = 'offline';
+      statusText = 'Authenticating...';
+    } else if (isConnected) {
+      statusClass = 'online';
+      statusText = `Firebase Live <span class="uid-tag" title="Authenticated UID: ${esc(playerId)}">UID: ${esc(playerId.slice(0, 6))}…</span>`;
+    } else {
+      statusClass = 'offline';
+      statusText = 'Connecting RTDB...';
+    }
+  }
+
   app.innerHTML = `
     <main class="wrap">
       <header>
         <div class="header-left">
           <div class="header-title-row">
             <h1>Quiz Battle Arena</h1>
-            <div id="connection-status" class="status-pill ${hasFirebase ? (isConnected ? 'online' : 'offline') : 'local'}">
-              <span class="status-dot"></span> ${hasFirebase ? (isConnected ? 'Firebase RTDB Live' : 'Connecting...') : 'Local Mode (Dev)'}
+            <div id="connection-status" class="status-pill ${statusClass}">
+              <span class="status-dot"></span> ${statusText}
             </div>
           </div>
           <div class="header-desc">2–4 players · 10 questions · Live multiplayer quiz showdown</div>
@@ -330,12 +530,16 @@ function renderHome(errorMessage = '') {
 
       ${errorMessage ? `<div class="notice-box error">${esc(errorMessage)}</div>` : ''}
 
-      ${!hasFirebase ? `
+      ${hasFirebase ? `
+        <div id="auth-indicator" class="auth-status-bar ${!isAuthReady ? 'pending' : (authError ? 'error' : 'ready')}">
+          ${!isAuthReady ? '🔒 Authenticating player anonymously with Firebase...' : (authError ? `⚠️ Anonymous Auth Failed: ${esc(authError)} <button id="btn-auth-retry" type="button" class="retry-link">Retry</button>` : `✓ Authenticated anonymously as <span class="uid-code" title="${esc(playerId)}">UID: ${esc(playerId.slice(0, 8))}…</span>`)}
+        </div>
+      ` : `
         <div class="notice-box warning">
           <strong>⚡ Local Development Mode:</strong> Firebase environment variables are not set in <code>.env.local</code>.
           Local fallback sync is active across browser tabs. To connect separate mobile devices and desktops, set your <code>VITE_FIREBASE_*</code> credentials.
         </div>
-      ` : ''}
+      `}
 
       <label for="player-name">Your Player Name</label>
       <input id="player-name" maxlength="16" placeholder="e.g., Alex, QuizMaster" value="${esc(playerName)}" autocomplete="off" />
@@ -343,13 +547,15 @@ function renderHome(errorMessage = '') {
       <div class="twocol">
         <div class="create-group">
           <label>Create New Game</label>
-          <button id="btn-create" class="primary" type="button">⚡ Create Room</button>
+          <button id="btn-create" class="primary" type="button" ${hasFirebase && !isAuthReady ? 'disabled' : ''}>
+            ${hasFirebase && !isAuthReady ? '⏳ Authenticating...' : '⚡ Create Room'}
+          </button>
         </div>
         <div class="join-group">
           <label for="room-code">Join with Code</label>
           <div style="display:flex; gap:8px;">
             <input id="room-code" maxlength="4" placeholder="ABCD" value="${esc(roomFromUrl.toUpperCase())}" style="text-transform:uppercase; letter-spacing:2px; font-weight:700;" autocomplete="off" />
-            <button id="btn-join" class="secondary" style="width: auto; padding: 0 20px;" type="button">Join</button>
+            <button id="btn-join" class="secondary" style="width: auto; padding: 0 20px;" type="button" ${hasFirebase && !isAuthReady ? 'disabled' : ''}>Join</button>
           </div>
         </div>
       </div>
@@ -366,6 +572,11 @@ function renderHome(errorMessage = '') {
       </div>
     </div>
   `;
+
+  updateAuthButtonsState();
+
+  const retryBtn = document.querySelector('#btn-auth-retry');
+  if (retryBtn) retryBtn.onclick = () => ensureAuth();
 
   document.querySelector('#btn-create').onclick = handleCreateRoom;
   document.querySelector('#btn-join').onclick = handleJoinRoom;
@@ -410,6 +621,20 @@ async function handleCreateRoom() {
   const name = getValidatedName();
   if (!name) return;
 
+  // Wait for Firebase authentication to complete if Firebase is active
+  if (hasFirebase && !isAuthReady) {
+    const btnCreate = document.querySelector('#btn-create');
+    if (btnCreate) {
+      btnCreate.disabled = true;
+      btnCreate.textContent = '⏳ Authenticating...';
+    }
+    await ensureAuth();
+  }
+
+  if (hasFirebase && !authUser) {
+    switchToLocalFallback('Anonymous auth unavailable');
+  }
+
   room = generateRoomCode();
   saveStoredSession({ room, playerId, name });
 
@@ -441,7 +666,7 @@ async function handleCreateRoom() {
 
     startListening();
   } catch (err) {
-    console.error('Error creating room:', err);
+    console.warn('Error creating room:', err);
     renderHome(`Failed to create room: ${err.message || 'Firebase error'}`);
   }
 }
@@ -456,6 +681,17 @@ async function handleJoinRoom() {
   if (!/^[A-Z0-9]{4}$/.test(targetCode)) {
     renderHome('Room code must be exactly 4 letters or digits.');
     return;
+  }
+
+  // Wait for Firebase authentication to complete if Firebase is active
+  if (hasFirebase && !isAuthReady) {
+    const btnJoin = document.querySelector('#btn-join');
+    if (btnJoin) btnJoin.disabled = true;
+    await ensureAuth();
+  }
+
+  if (hasFirebase && !authUser) {
+    switchToLocalFallback('Anonymous auth unavailable');
   }
 
   room = targetCode;
@@ -505,7 +741,7 @@ async function handleJoinRoom() {
       startListening();
     }, { onlyOnce: true });
   } catch (err) {
-    console.error('Error joining room:', err);
+    console.warn('Error joining room:', err);
     renderHome(`Failed to join room: ${err.message || 'Connection error'}`);
   }
 }
@@ -842,7 +1078,7 @@ async function handleAnswerSelection(choice, correctIndex, qIndex, me, data) {
 
     await update(ref(db), updates);
   } catch (err) {
-    console.error('Error recording answer:', err);
+    console.warn('Error recording answer:', err);
   }
 
   // Smooth delay for feedback reading before advancing
@@ -975,7 +1211,13 @@ function renderResults(data, me) {
 // -------------------------------------------------------------
 // 12. Initialization & Reconnection
 // -------------------------------------------------------------
-function init() {
+async function init() {
+  renderHome();
+
+  if (hasFirebase && authReadyPromise) {
+    await authReadyPromise;
+  }
+
   if (room && playerId && playerName) {
     // Attempt graceful reconnection to previous room
     try {
@@ -991,8 +1233,6 @@ function init() {
     } catch (e) {
       renderHome();
     }
-  } else {
-    renderHome();
   }
 }
 
