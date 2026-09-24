@@ -6,7 +6,8 @@ import {
   set as fbSet,
   update as fbUpdate,
   onValue as fbOnValue,
-  onDisconnect as fbOnDisconnect
+  onDisconnect as fbOnDisconnect,
+  runTransaction as fbRunTransaction
 } from 'firebase/database';
 import {
   getAuth,
@@ -228,6 +229,20 @@ function onDisconnect(refObj) {
     };
   }
   return fbOnDisconnect(refObj);
+}
+
+async function runTransaction(refObj, updateFunction) {
+  if (refObj && refObj.isMock) {
+    const curVal = getMockValue(refObj.path);
+    const cloned = curVal === undefined || curVal === null ? null : JSON.parse(JSON.stringify(curVal));
+    const newVal = updateFunction(cloned);
+    if (newVal !== undefined) {
+      setMockValue(refObj.path, newVal);
+      saveMockData(refObj.path);
+    }
+    return { committed: true, snapshot: createMockSnapshot(refObj.path) };
+  }
+  return fbRunTransaction(refObj, updateFunction);
 }
 
 // Listen to Firebase connection state
@@ -754,34 +769,14 @@ async function handleJoinRoom() {
 }
 
 // -------------------------------------------------------------
-// 7. Realtime Room Listener
-// -------------------------------------------------------------
-function startListening() {
-  if (unsubscribe) {
-    unsubscribe();
-    unsubscribe = null;
-  }
-
-  const roomRef = ref(db, `rooms/${room}`);
-  unsubscribe = onValue(roomRef, (snapshot) => {
-    const data = snapshot.val();
-    if (!data) {
-      clearStoredSession();
-      renderHome('The room was closed or does not exist.');
-      return;
-    }
-    renderRoom(data);
-  });
-}
-
-// -------------------------------------------------------------
-// 7. Synchronized Game Timing & Progression Helpers
+// 7. Synchronized Game Timing, Watchdog & Progression Engine
 // -------------------------------------------------------------
 let lastRoomData = null;
 let timerInterval = null;
 let currentTimerQIndex = -1;
-let advanceTimeout = null;
+let watchdogInterval = null;
 let isAdvancingQuestion = false;
+let isSettingRevealed = false;
 let renderedGameState = {
   qIndex: -1,
   questionStatus: '',
@@ -789,20 +784,158 @@ let renderedGameState = {
   score: -1
 };
 
-function getActiveCoordinatorId(data) {
-  if (!data || !data.players) return data?.hostId || '';
+function startWatchdog() {
+  if (!watchdogInterval) {
+    watchdogInterval = setInterval(runProgressionWatchdog, 400);
+  }
+}
+
+function stopWatchdog() {
+  if (watchdogInterval) {
+    clearInterval(watchdogInterval);
+    watchdogInterval = null;
+  }
+}
+
+/**
+ * Deterministically ranks active contestants to coordinate progression.
+ * Host is primary; earliest joined active player is backup.
+ */
+function getCoordinatorList(data) {
+  if (!data || !data.players) return [];
   const players = Object.values(data.players);
-  // Check if host is online
-  const host = players.find(p => p.id === data.hostId);
-  if (host && host.online !== false) {
-    return host.id;
+  const onlinePlayers = players.filter(p => p.online !== false);
+  const pool = onlinePlayers.length > 0 ? onlinePlayers : players;
+
+  return [...pool].sort((a, b) => {
+    if (a.id === data.hostId) return -1;
+    if (b.id === data.hostId) return 1;
+    const tA = a.joinedAt || 0;
+    const tB = b.joinedAt || 0;
+    if (tA !== tB) return tA - tB;
+    return String(a.id).localeCompare(String(b.id));
+  }).map(p => p.id);
+}
+
+function isPrimaryCoordinator(data) {
+  const list = getCoordinatorList(data);
+  return list.length > 0 && list[0] === playerId;
+}
+
+/**
+ * Atomically marks the question as 'revealed' and sets the 2-second transition window.
+ * Idempotent across multiple clients.
+ */
+async function transitionQuestionToRevealed(expectedQIndex, delayMs = 2000) {
+  if (!room || isSettingRevealed) return;
+  if (!lastRoomData || lastRoomData.status !== 'playing') return;
+  const currentQ = lastRoomData.currentQuestion ?? 0;
+  if (currentQ !== expectedQIndex) return;
+  if (lastRoomData.questionStatus === 'revealed' || lastRoomData.questionStatus === 'completed') return;
+
+  isSettingRevealed = true;
+  try {
+    const roomPath = `rooms/${room}`;
+    await runTransaction(ref(db, roomPath), (current) => {
+      if (!current || current.status !== 'playing') return current;
+      if ((current.currentQuestion ?? 0) !== expectedQIndex) return current;
+      if (current.questionStatus === 'revealed' || current.questionStatus === 'completed') return current;
+
+      current.questionStatus = 'revealed';
+      current.advanceTime = Date.now() + delayMs;
+      return current;
+    });
+  } catch (err) {
+    console.warn('Error transitioning question to revealed:', err);
+  } finally {
+    isSettingRevealed = false;
   }
-  // Host offline: pick earliest joined online player
-  const onlinePlayers = players.filter(p => p.online !== false).sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
-  if (onlinePlayers.length > 0) {
-    return onlinePlayers[0].id;
+}
+
+/**
+ * Atomically advances to the next question or finishes the match.
+ * Uses atomic transaction so only ONE client ever increments currentQuestion.
+ */
+async function atomicallyAdvanceQuestion(expectedQIndex) {
+  if (!room || isAdvancingQuestion) return;
+  if (!lastRoomData || lastRoomData.status !== 'playing') return;
+  const currentQ = lastRoomData.currentQuestion ?? 0;
+  if (currentQ !== expectedQIndex) return;
+
+  isAdvancingQuestion = true;
+  try {
+    const roomPath = `rooms/${room}`;
+    await runTransaction(ref(db, roomPath), (current) => {
+      if (!current || current.status !== 'playing') return current;
+      const q = current.currentQuestion ?? 0;
+      if (q !== expectedQIndex) return current; // Already advanced!
+
+      const isRevealed = current.questionStatus === 'revealed';
+      const isExpired = current.questionEndTime && Date.now() >= current.questionEndTime;
+      if (!isRevealed && !isExpired) return current;
+
+      const nextQ = expectedQIndex + 1;
+      const now = Date.now();
+      if (nextQ < 10) {
+        current.currentQuestion = nextQ;
+        current.questionStartTime = now;
+        current.questionEndTime = now + 60000;
+        current.questionStatus = 'active';
+        current.advanceTime = 0;
+      } else {
+        current.currentQuestion = 10;
+        current.status = 'finished';
+        current.questionStatus = 'completed';
+        current.advanceTime = 0;
+      }
+      return current;
+    });
+  } catch (err) {
+    console.warn('Error atomically advancing question:', err);
+  } finally {
+    isAdvancingQuestion = false;
   }
-  return data.hostId || '';
+}
+
+/**
+ * Resilient heartbeat watchdog running every 400ms.
+ * Catches timer timeouts, early answer completion, and failovers even if browser intervals were throttled.
+ */
+function runProgressionWatchdog() {
+  if (!lastRoomData || lastRoomData.status !== 'playing') return;
+  const now = Date.now();
+  const qIndex = lastRoomData.currentQuestion ?? 0;
+  const qStatus = lastRoomData.questionStatus || 'active';
+  const endTime = lastRoomData.questionEndTime || 0;
+  const advanceTime = lastRoomData.advanceTime || 0;
+
+  // 1. In active state: check early completion or timeout (including recovering stuck rooms)
+  if (qStatus === 'active') {
+    const players = Object.values(lastRoomData.players || {});
+    const onlinePlayers = players.filter(p => p.online !== false);
+    const pool = onlinePlayers.length > 0 ? onlinePlayers : players;
+    const allAnswered = pool.length > 0 && pool.every(p => Boolean(p.answers && p.answers[qIndex]));
+
+    if (allAnswered) {
+      transitionQuestionToRevealed(qIndex, 2000);
+      return;
+    }
+
+    // Timer expired, or recovering existing room stuck in the past
+    if (endTime > 0 && now >= endTime) {
+      if (isPrimaryCoordinator(lastRoomData) || now >= endTime + 800) {
+        transitionQuestionToRevealed(qIndex, 2000);
+        return;
+      }
+    }
+  }
+
+  // 2. In revealed state: check if 2-second transition time has elapsed
+  if (qStatus === 'revealed' && advanceTime > 0 && now >= advanceTime) {
+    if (isPrimaryCoordinator(lastRoomData) || now >= advanceTime + 800) {
+      atomicallyAdvanceQuestion(qIndex);
+    }
+  }
 }
 
 function stopTimerLoop() {
@@ -848,77 +981,40 @@ function startTimerLoop(endTime, qIndex) {
     }
 
     if (remainingSeconds <= 0) {
-      stopTimerLoop();
-      handleTimerExpired(qIndex);
+      // Disable buttons immediately on timeout
+      const buttons = document.querySelectorAll('.answer-btn');
+      buttons.forEach(b => { b.disabled = true; });
+      transitionQuestionToRevealed(qIndex, 2000);
     }
   }
 
   updateTimerDisplay();
-  timerInterval = setInterval(updateTimerDisplay, 200);
-}
-
-async function handleTimerExpired(qIndex) {
-  // Lock local answer buttons immediately
-  const buttons = document.querySelectorAll('.answer-btn');
-  buttons.forEach(b => { b.disabled = true; });
-
-  if (!lastRoomData || lastRoomData.status !== 'playing' || (lastRoomData.currentQuestion ?? 0) !== qIndex) {
-    return;
-  }
-
-  // If question is still active, transition to revealed
-  if (lastRoomData.questionStatus === 'active') {
-    const coordinatorId = getActiveCoordinatorId(lastRoomData);
-    if (playerId === coordinatorId) {
-      try {
-        await update(ref(db, `rooms/${room}`), {
-          questionStatus: 'revealed',
-          advanceTime: Date.now() + 2000
-        });
-      } catch (e) {
-        console.warn('Error setting question revealed on timer expiry:', e);
-      }
-    }
-  }
-}
-
-function scheduleAdvance(expectedQIndex, delayMs) {
-  if (advanceTimeout) clearTimeout(advanceTimeout);
-  advanceTimeout = setTimeout(async () => {
-    if (!lastRoomData || lastRoomData.status !== 'playing') return;
-    if ((lastRoomData.currentQuestion ?? 0) !== expectedQIndex || lastRoomData.questionStatus !== 'revealed') return;
-    if (isAdvancingQuestion) return;
-
-    isAdvancingQuestion = true;
-    try {
-      const nextQ = expectedQIndex + 1;
-      const now = Date.now();
-      if (nextQ < 10) {
-        await update(ref(db, `rooms/${room}`), {
-          currentQuestion: nextQ,
-          questionStartTime: now,
-          questionEndTime: now + 60000,
-          questionStatus: 'active',
-          advanceTime: 0
-        });
-      } else {
-        await update(ref(db, `rooms/${room}`), {
-          status: 'finished',
-          questionStatus: 'completed',
-          advanceTime: 0
-        });
-      }
-    } catch (err) {
-      console.warn('Error advancing question:', err);
-    } finally {
-      isAdvancingQuestion = false;
-    }
-  }, Math.max(50, delayMs));
+  timerInterval = setInterval(updateTimerDisplay, 250);
 }
 
 // -------------------------------------------------------------
-// 8. Room Router & Waiting Room (Lobby)
+// 8. Room Router & Realtime Listener
 // -------------------------------------------------------------
+function startListening() {
+  if (unsubscribe) {
+    unsubscribe();
+    unsubscribe = null;
+  }
+
+  startWatchdog();
+
+  const roomRef = ref(db, `rooms/${room}`);
+  unsubscribe = onValue(roomRef, (snapshot) => {
+    const data = snapshot.val();
+    if (!data) {
+      clearStoredSession();
+      renderHome('The room was closed or does not exist.');
+      return;
+    }
+    renderRoom(data);
+  });
+}
+
 function renderRoom(data) {
   lastRoomData = data;
   const players = Object.values(data.players || {});
@@ -930,32 +1026,8 @@ function renderRoom(data) {
     return;
   }
 
-  // Safety watchdogs for coordinator progression
-  if (data.status === 'playing') {
-    const coordinatorId = getActiveCoordinatorId(data);
-    const now = Date.now();
-
-    // 1. If timer expired but question is still active, coordinator (or watchdog after 800ms) sets revealed
-    if (data.questionStatus === 'active' && data.questionEndTime && now >= data.questionEndTime) {
-      if (playerId === coordinatorId || now >= data.questionEndTime + 800) {
-        update(ref(db, `rooms/${room}`), {
-          questionStatus: 'revealed',
-          advanceTime: now + 2000
-        }).catch(() => {});
-      }
-    }
-
-    // 2. If question is revealed, coordinator schedules advance (or watchdog after 1500ms)
-    if (data.questionStatus === 'revealed' && data.advanceTime) {
-      const delay = Math.max(0, data.advanceTime - now);
-      if (playerId === coordinatorId) {
-        scheduleAdvance(data.currentQuestion ?? 0, delay);
-      } else if (now >= data.advanceTime + 1500) {
-        // Watchdog failover in case coordinator disconnected
-        scheduleAdvance(data.currentQuestion ?? 0, 50);
-      }
-    }
-  }
+  // Trigger heartbeat evaluation immediately on snapshot
+  runProgressionWatchdog();
 
   // Route based on room status
   if (data.status === 'playing') {
@@ -998,6 +1070,7 @@ function renderGame(data, me) {
   const now = Date.now();
   const endTime = data.questionEndTime || (now + 60000);
   const remainingSeconds = Math.max(0, Math.ceil((endTime - now) / 1000));
+  const isTimedOut = remainingSeconds <= 0;
   const timerPercent = Math.max(0, Math.min(100, (remainingSeconds / 60) * 100));
 
   let timerMode = 'normal';
@@ -1007,7 +1080,7 @@ function renderGame(data, me) {
     timerMode = 'warning';
   }
 
-  if (!isRevealed) {
+  if (!isRevealed && !isTimedOut) {
     startTimerLoop(endTime, qIndex);
   } else {
     stopTimerLoop();
@@ -1029,7 +1102,7 @@ function renderGame(data, me) {
         const pAns = p.answers && p.answers[qIndex];
         const statusLabel = pAns
           ? '<span style="color:var(--success); font-weight:600;">✓ Answered</span>'
-          : (isRevealed ? '<span style="color:var(--error);">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
+          : (isRevealed || isTimedOut ? '<span style="color:var(--error);">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
         return `
           <div class="rank-item ${p.id === playerId ? 'is-me' : ''}">
             <span class="rank-num">${i + 1}</span>
@@ -1064,13 +1137,6 @@ function renderGame(data, me) {
           <span>Score: ${me.score || 0} / 10</span>
         </div>
       `;
-    } else if (myAnswer.timedOut) {
-      feedbackHtml = `
-        <div class="feedback-banner wrong">
-          <span>⏱️ Time expired! Correct answer was Option ${String.fromCharCode(65 + q[2])}.</span>
-          <span>Score: ${me.score || 0} / 10</span>
-        </div>
-      `;
     } else {
       feedbackHtml = `
         <div class="feedback-banner wrong">
@@ -1079,7 +1145,7 @@ function renderGame(data, me) {
         </div>
       `;
     }
-  } else if (isRevealed) {
+  } else if (isRevealed || isTimedOut) {
     feedbackHtml = `
       <div class="feedback-banner wrong">
         <span>⏱️ Time expired! Correct answer was Option ${String.fromCharCode(65 + q[2])}.</span>
@@ -1088,6 +1154,8 @@ function renderGame(data, me) {
     `;
   }
 
+  const isBtnDisabled = hasAnswered || isRevealed || isTimedOut || isAnswering;
+
   screen.innerHTML = `
     <div class="game-grid">
       <!-- Main Quiz Card -->
@@ -1095,16 +1163,16 @@ function renderGame(data, me) {
         <div class="quiz-top">
           <div class="quiz-top-left">
             <span class="q-badge">Question ${qIndex + 1} of 10</span>
-            <div id="timer-pill" class="timer-pill ${isRevealed ? 'urgent' : timerMode}">
+            <div id="timer-pill" class="timer-pill ${isRevealed || isTimedOut ? 'urgent' : timerMode}">
               <span>⏱️</span>
-              <strong id="timer-text">${isRevealed ? 'Time Left: 0s' : `Time Left: ${remainingSeconds}s`}</strong>
+              <strong id="timer-text">${isRevealed || isTimedOut ? 'Time Left: 0s' : `Time Left: ${remainingSeconds}s`}</strong>
             </div>
           </div>
           <div>Score: <strong>${me.score || 0} pts</strong></div>
         </div>
 
-        <div class="timer-track" role="progressbar" aria-valuenow="${isRevealed ? 0 : remainingSeconds}" aria-valuemin="0" aria-valuemax="60">
-          <div id="timer-bar" class="timer-bar ${isRevealed ? 'urgent' : timerMode}" style="width: ${isRevealed ? 0 : timerPercent}%;"></div>
+        <div class="timer-track" role="progressbar" aria-valuenow="${isRevealed || isTimedOut ? 0 : remainingSeconds}" aria-valuemin="0" aria-valuemax="60">
+          <div id="timer-bar" class="timer-bar ${isRevealed || isTimedOut ? 'urgent' : timerMode}" style="width: ${isRevealed || isTimedOut ? 0 : timerPercent}%;"></div>
         </div>
 
         <h2 class="question-text">${esc(q[0])}</h2>
@@ -1119,12 +1187,11 @@ function renderGame(data, me) {
               } else if (idx === q[2]) {
                 extraClass = 'revealed-correct';
               }
-            } else if (isRevealed) {
+            } else if (isRevealed || isTimedOut) {
               if (idx === q[2]) {
                 extraClass = 'revealed-correct';
               }
             }
-            const isBtnDisabled = hasAnswered || isRevealed || isAnswering;
             return `
               <button class="answer-btn ${extraClass}" data-index="${idx}" ${isBtnDisabled ? 'disabled' : ''} type="button">
                 <span class="answer-letter">${letter}</span>
@@ -1158,7 +1225,7 @@ function renderGame(data, me) {
             const pAns = p.answers && p.answers[qIndex];
             const statusLabel = pAns
               ? '<span style="color:var(--success); font-weight:600;">✓ Answered</span>'
-              : (isRevealed ? '<span style="color:var(--error);">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
+              : (isRevealed || isTimedOut ? '<span style="color:var(--error);">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
             return `
               <div class="rank-item ${p.id === playerId ? 'is-me' : ''}">
                 <span class="rank-num">${i + 1}</span>
@@ -1183,7 +1250,7 @@ function renderGame(data, me) {
   `;
 
   // Attach click handlers to answer buttons if not already answered
-  if (!hasAnswered && !isRevealed) {
+  if (!hasAnswered && !isRevealed && !isTimedOut) {
     document.querySelectorAll('.answer-btn').forEach((btn) => {
       btn.onclick = () => {
         const choice = Number(btn.dataset.index);
@@ -1351,6 +1418,133 @@ function renderResults(data, me) {
   document.querySelector('#btn-home').onclick = handleLeaveRoom;
 }
 
+function renderLobby(data, me, players) {
+  const isHost = data.hostId === playerId;
+  const canStart = players.length >= 2;
+  const hostPlayer = players.find(p => p.id === data.hostId) || { name: 'Host' };
+
+  const shareUrl = `${window.location.origin}${window.location.pathname}?room=${room}`;
+
+  const screen = document.querySelector('#screen');
+  screen.innerHTML = `
+    <div class="card hero">
+      <div class="room-header">
+        <div class="room-code-display">
+          <span>ROOM CODE</span>
+          <strong>${room}</strong>
+        </div>
+        <div class="room-actions">
+          <button id="btn-copy-code" class="secondary" type="button">📋 Copy Code</button>
+          <button id="btn-copy-link" class="secondary" type="button">🔗 Share Link</button>
+        </div>
+      </div>
+
+      <h2>Waiting for Players</h2>
+      <p class="muted">
+        ${players.length}/4 players connected.
+        ${canStart ? 'Ready to begin! The host can start the quiz.' : 'Need at least 2 players to start a quiz battle.'}
+      </p>
+
+      <div class="player-list-header">
+        <h3>Connected Contestants</h3>
+        <span class="player-count-badge">${players.length} / 4 Players</span>
+      </div>
+
+      <div class="players">
+        ${players.map(p => `
+          <div class="player-row">
+            <div class="player-avatar">${esc(p.name[0] || '?').toUpperCase()}</div>
+            <div class="player-info">
+              <div class="player-name-line">
+                <span>${esc(p.name)}</span>
+                ${p.id === data.hostId ? '<span class="host-tag">Host</span>' : ''}
+                ${p.id === playerId ? '<span class="you-tag">You</span>' : ''}
+              </div>
+              <div class="player-status-line">
+                ${p.online !== false ? '🟢 Connected' : '⚪ Offline / Refreshing'}
+              </div>
+            </div>
+            <div class="player-score">${p.score || 0} pts</div>
+          </div>
+        `).join('')}
+      </div>
+
+      ${isHost ? `
+        <button id="btn-start" class="primary" style="margin-top:12px;" ${!canStart ? 'disabled' : ''} type="button">
+          ${canStart ? '🚀 Start Quiz Battle' : 'Waiting for at least 2 players...'}
+        </button>
+      ` : `
+        <div class="notice-box">
+          ⏳ Waiting for host <strong>${esc(hostPlayer.name)}</strong> to start the game...
+        </div>
+      `}
+
+      <button id="btn-leave" class="danger" style="margin-top:16px;" type="button">Leave Room</button>
+    </div>
+  `;
+
+  document.querySelector('#btn-copy-code').onclick = () => {
+    navigator.clipboard?.writeText(room);
+    const btn = document.querySelector('#btn-copy-code');
+    btn.textContent = '✓ Copied!';
+    setTimeout(() => { btn.textContent = '📋 Copy Code'; }, 1800);
+  };
+
+  document.querySelector('#btn-copy-link').onclick = () => {
+    navigator.clipboard?.writeText(shareUrl);
+    const btn = document.querySelector('#btn-copy-link');
+    btn.textContent = '✓ Link Copied!';
+    setTimeout(() => { btn.textContent = '🔗 Share Link'; }, 1800);
+  };
+
+  const startBtn = document.querySelector('#btn-start');
+  if (startBtn && isHost) {
+    startBtn.onclick = async () => {
+      if (players.length < 2) return;
+      const now = Date.now();
+      const updates = {
+        status: 'playing',
+        startedAt: now,
+        currentQuestion: 0,
+        questionStartTime: now,
+        questionEndTime: now + 60000,
+        questionStatus: 'active',
+        advanceTime: 0
+      };
+      // Reset all players scores, question index to 0, and clear answers
+      for (const p of players) {
+        updates[`players/${p.id}/score`] = 0;
+        updates[`players/${p.id}/question`] = 0;
+        updates[`players/${p.id}/answers`] = {};
+      }
+      await update(ref(db, `rooms/${room}`), updates);
+    };
+  }
+
+  document.querySelector('#btn-leave').onclick = handleLeaveRoom;
+}
+
+async function handleLeaveRoom() {
+  stopTimerLoop();
+  stopWatchdog();
+  isAdvancingQuestion = false;
+  isSettingRevealed = false;
+  if (room && playerId) {
+    try {
+      await update(ref(db, `rooms/${room}/players/${playerId}`), {
+        online: false
+      });
+    } catch (e) {}
+  }
+  clearStoredSession();
+  if (unsubscribe) {
+    unsubscribe();
+    unsubscribe = null;
+  }
+  room = '';
+  renderHome();
+}
+
 // -------------------------------------------------------------
 // 11. Initialization & Reconnection
 // -------------------------------------------------------------
@@ -1367,6 +1561,10 @@ async function init() {
       const roomRef = ref(db, `rooms/${room}`);
       onValue(roomRef, (snap) => {
         if (snap.exists()) {
+          update(ref(db, `rooms/${room}/players/${playerId}`), { online: true }).catch(() => {});
+          try {
+            onDisconnect(ref(db, `rooms/${room}/players/${playerId}/online`)).set(false);
+          } catch (err) {}
           startListening();
         } else {
           clearStoredSession();
