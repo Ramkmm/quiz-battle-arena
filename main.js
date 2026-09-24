@@ -645,12 +645,18 @@ async function handleCreateRoom() {
       status: 'lobby',
       createdAt: Date.now(),
       hostId: playerId,
+      currentQuestion: 0,
+      questionStartTime: 0,
+      questionEndTime: 0,
+      questionStatus: 'idle',
+      advanceTime: 0,
       players: {
         [playerId]: {
           id: playerId,
           name,
           score: 0,
           question: 0,
+          answers: {},
           online: true,
           joinedAt: Date.now()
         }
@@ -728,6 +734,7 @@ async function handleJoinRoom() {
         name,
         score: existing.score || 0,
         question: existing.question || 0,
+        answers: existing.answers || {},
         online: true,
         joinedAt: existing.joinedAt || Date.now()
       });
@@ -768,9 +775,152 @@ function startListening() {
 }
 
 // -------------------------------------------------------------
+// 7. Synchronized Game Timing & Progression Helpers
+// -------------------------------------------------------------
+let lastRoomData = null;
+let timerInterval = null;
+let currentTimerQIndex = -1;
+let advanceTimeout = null;
+let isAdvancingQuestion = false;
+let renderedGameState = {
+  qIndex: -1,
+  questionStatus: '',
+  hasAnswered: false,
+  score: -1
+};
+
+function getActiveCoordinatorId(data) {
+  if (!data || !data.players) return data?.hostId || '';
+  const players = Object.values(data.players);
+  // Check if host is online
+  const host = players.find(p => p.id === data.hostId);
+  if (host && host.online !== false) {
+    return host.id;
+  }
+  // Host offline: pick earliest joined online player
+  const onlinePlayers = players.filter(p => p.online !== false).sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
+  if (onlinePlayers.length > 0) {
+    return onlinePlayers[0].id;
+  }
+  return data.hostId || '';
+}
+
+function stopTimerLoop() {
+  if (timerInterval) {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
+  currentTimerQIndex = -1;
+}
+
+function startTimerLoop(endTime, qIndex) {
+  if (timerInterval && currentTimerQIndex === qIndex) {
+    return;
+  }
+  stopTimerLoop();
+  currentTimerQIndex = qIndex;
+
+  function updateTimerDisplay() {
+    const now = Date.now();
+    const remainingSeconds = Math.max(0, Math.ceil((endTime - now) / 1000));
+    const percent = Math.max(0, Math.min(100, (remainingSeconds / 60) * 100));
+
+    const textEl = document.querySelector('#timer-text');
+    const pillEl = document.querySelector('#timer-pill');
+    const barEl = document.querySelector('#timer-bar');
+
+    let mode = 'normal';
+    if (remainingSeconds <= 5) {
+      mode = 'urgent';
+    } else if (remainingSeconds <= 15) {
+      mode = 'warning';
+    }
+
+    if (textEl) {
+      textEl.textContent = `Time Left: ${remainingSeconds}s`;
+    }
+    if (pillEl) {
+      pillEl.className = `timer-pill ${mode}`;
+    }
+    if (barEl) {
+      barEl.className = `timer-bar ${mode}`;
+      barEl.style.width = `${percent}%`;
+    }
+
+    if (remainingSeconds <= 0) {
+      stopTimerLoop();
+      handleTimerExpired(qIndex);
+    }
+  }
+
+  updateTimerDisplay();
+  timerInterval = setInterval(updateTimerDisplay, 200);
+}
+
+async function handleTimerExpired(qIndex) {
+  // Lock local answer buttons immediately
+  const buttons = document.querySelectorAll('.answer-btn');
+  buttons.forEach(b => { b.disabled = true; });
+
+  if (!lastRoomData || lastRoomData.status !== 'playing' || (lastRoomData.currentQuestion ?? 0) !== qIndex) {
+    return;
+  }
+
+  // If question is still active, transition to revealed
+  if (lastRoomData.questionStatus === 'active') {
+    const coordinatorId = getActiveCoordinatorId(lastRoomData);
+    if (playerId === coordinatorId) {
+      try {
+        await update(ref(db, `rooms/${room}`), {
+          questionStatus: 'revealed',
+          advanceTime: Date.now() + 2000
+        });
+      } catch (e) {
+        console.warn('Error setting question revealed on timer expiry:', e);
+      }
+    }
+  }
+}
+
+function scheduleAdvance(expectedQIndex, delayMs) {
+  if (advanceTimeout) clearTimeout(advanceTimeout);
+  advanceTimeout = setTimeout(async () => {
+    if (!lastRoomData || lastRoomData.status !== 'playing') return;
+    if ((lastRoomData.currentQuestion ?? 0) !== expectedQIndex || lastRoomData.questionStatus !== 'revealed') return;
+    if (isAdvancingQuestion) return;
+
+    isAdvancingQuestion = true;
+    try {
+      const nextQ = expectedQIndex + 1;
+      const now = Date.now();
+      if (nextQ < 10) {
+        await update(ref(db, `rooms/${room}`), {
+          currentQuestion: nextQ,
+          questionStartTime: now,
+          questionEndTime: now + 60000,
+          questionStatus: 'active',
+          advanceTime: 0
+        });
+      } else {
+        await update(ref(db, `rooms/${room}`), {
+          status: 'finished',
+          questionStatus: 'completed',
+          advanceTime: 0
+        });
+      }
+    } catch (err) {
+      console.warn('Error advancing question:', err);
+    } finally {
+      isAdvancingQuestion = false;
+    }
+  }, Math.max(50, delayMs));
+}
+
+// -------------------------------------------------------------
 // 8. Room Router & Waiting Room (Lobby)
 // -------------------------------------------------------------
 function renderRoom(data) {
+  lastRoomData = data;
   const players = Object.values(data.players || {});
   const me = (data.players || {})[playerId];
 
@@ -780,175 +930,181 @@ function renderRoom(data) {
     return;
   }
 
-  // Route based on room status and player progress
+  // Safety watchdogs for coordinator progression
+  if (data.status === 'playing') {
+    const coordinatorId = getActiveCoordinatorId(data);
+    const now = Date.now();
+
+    // 1. If timer expired but question is still active, coordinator (or watchdog after 800ms) sets revealed
+    if (data.questionStatus === 'active' && data.questionEndTime && now >= data.questionEndTime) {
+      if (playerId === coordinatorId || now >= data.questionEndTime + 800) {
+        update(ref(db, `rooms/${room}`), {
+          questionStatus: 'revealed',
+          advanceTime: now + 2000
+        }).catch(() => {});
+      }
+    }
+
+    // 2. If question is revealed, coordinator schedules advance (or watchdog after 1500ms)
+    if (data.questionStatus === 'revealed' && data.advanceTime) {
+      const delay = Math.max(0, data.advanceTime - now);
+      if (playerId === coordinatorId) {
+        scheduleAdvance(data.currentQuestion ?? 0, delay);
+      } else if (now >= data.advanceTime + 1500) {
+        // Watchdog failover in case coordinator disconnected
+        scheduleAdvance(data.currentQuestion ?? 0, 50);
+      }
+    }
+  }
+
+  // Route based on room status
   if (data.status === 'playing') {
     renderGame(data, me);
     return;
   }
 
-  // Finished state
   if (data.status === 'finished') {
+    stopTimerLoop();
     renderResults(data, me);
     return;
   }
 
   // Lobby / Waiting Room
+  stopTimerLoop();
   renderLobby(data, me, players);
 }
 
-function renderLobby(data, me, players) {
-  const isHost = data.hostId === playerId;
-  const canStart = players.length >= 2;
-  const hostPlayer = players.find(p => p.id === data.hostId) || { name: 'Host' };
-
-  const shareUrl = `${window.location.origin}${window.location.pathname}?room=${room}`;
-
-  const screen = document.querySelector('#screen');
-  screen.innerHTML = `
-    <div class="card hero">
-      <div class="room-header">
-        <div class="room-code-display">
-          <span>ROOM CODE</span>
-          <strong>${room}</strong>
-        </div>
-        <div class="room-actions">
-          <button id="btn-copy-code" class="secondary" type="button">📋 Copy Code</button>
-          <button id="btn-copy-link" class="secondary" type="button">🔗 Share Link</button>
-        </div>
-      </div>
-
-      <h2>Waiting for Players</h2>
-      <p class="muted">
-        ${players.length}/4 players connected.
-        ${canStart ? 'Ready to begin! The host can start the quiz.' : 'Need at least 2 players to start a quiz battle.'}
-      </p>
-
-      <div class="player-list-header">
-        <h3>Connected Contestants</h3>
-        <span class="player-count-badge">${players.length} / 4 Players</span>
-      </div>
-
-      <div class="players">
-        ${players.map(p => `
-          <div class="player-row">
-            <div class="player-avatar">${esc(p.name[0] || '?').toUpperCase()}</div>
-            <div class="player-info">
-              <div class="player-name-line">
-                <span>${esc(p.name)}</span>
-                ${p.id === data.hostId ? '<span class="host-tag">Host</span>' : ''}
-                ${p.id === playerId ? '<span class="you-tag">You</span>' : ''}
-              </div>
-              <div class="player-status-line">
-                ${p.online ? '🟢 Connected' : '⚪ Offline / Refreshing'}
-              </div>
-            </div>
-            <div class="player-score">${p.score || 0} pts</div>
-          </div>
-        `).join('')}
-      </div>
-
-      ${isHost ? `
-        <button id="btn-start" class="primary" style="margin-top:12px;" ${!canStart ? 'disabled' : ''} type="button">
-          ${canStart ? '🚀 Start Quiz Battle' : 'Waiting for at least 2 players...'}
-        </button>
-      ` : `
-        <div class="notice-box">
-          ⏳ Waiting for host <strong>${esc(hostPlayer.name)}</strong> to start the game...
-        </div>
-      `}
-
-      <button id="btn-leave" class="danger" style="margin-top:16px;" type="button">Leave Room</button>
-    </div>
-  `;
-
-  document.querySelector('#btn-copy-code').onclick = () => {
-    navigator.clipboard?.writeText(room);
-    const btn = document.querySelector('#btn-copy-code');
-    btn.textContent = '✓ Copied!';
-    setTimeout(() => { btn.textContent = '📋 Copy Code'; }, 1800);
-  };
-
-  document.querySelector('#btn-copy-link').onclick = () => {
-    navigator.clipboard?.writeText(shareUrl);
-    const btn = document.querySelector('#btn-copy-link');
-    btn.textContent = '✓ Link Copied!';
-    setTimeout(() => { btn.textContent = '🔗 Share Link'; }, 1800);
-  };
-
-  const startBtn = document.querySelector('#btn-start');
-  if (startBtn && isHost) {
-    startBtn.onclick = async () => {
-      if (players.length < 2) return;
-      const updates = {
-        status: 'playing',
-        startedAt: Date.now()
-      };
-      // Reset all players scores and question index to 0
-      for (const p of players) {
-        updates[`players/${p.id}/score`] = 0;
-        updates[`players/${p.id}/question`] = 0;
-      }
-      await update(ref(db, `rooms/${room}`), updates);
-    };
-  }
-
-  document.querySelector('#btn-leave').onclick = handleLeaveRoom;
-}
-
-async function handleLeaveRoom() {
-  if (room && playerId) {
-    try {
-      await update(ref(db, `rooms/${room}/players/${playerId}`), {
-        online: false
-      });
-    } catch (e) {}
-  }
-  clearStoredSession();
-  if (unsubscribe) {
-    unsubscribe();
-    unsubscribe = null;
-  }
-  room = '';
-  renderHome();
-}
-
 // -------------------------------------------------------------
-// 9. In-Game Quiz Screen
+// 9. In-Game Quiz Screen (Synchronized 60s Timer)
 // -------------------------------------------------------------
 function renderGame(data, me) {
   const players = Object.values(data.players || {});
-  const allFinished = players.length > 0 && players.every(p => (p.question || 0) >= 10);
+  const qIndex = Math.min(data.currentQuestion ?? 0, 10);
 
-  // If everyone has finished, transition to final results
-  if (allFinished) {
+  // If 10 questions completed, transition to final results
+  if (qIndex >= 10 || data.status === 'finished') {
+    stopTimerLoop();
     renderResults(data, me);
     return;
   }
 
-  const qIndex = Math.min(me.question || 0, 10);
+  const q = questions[qIndex];
+  const ranking = [...players].sort((a, b) => (b.score || 0) - (a.score || 0));
 
-  // If local player finished all 10 questions but waiting for others
-  if (qIndex >= 10) {
-    renderWaitingForOthers(data, me, players);
+  const myAnswer = (me.answers && me.answers[qIndex]) || null;
+  const hasAnswered = Boolean(myAnswer);
+  const isRevealed = data.questionStatus === 'revealed';
+
+  const now = Date.now();
+  const endTime = data.questionEndTime || (now + 60000);
+  const remainingSeconds = Math.max(0, Math.ceil((endTime - now) / 1000));
+  const timerPercent = Math.max(0, Math.min(100, (remainingSeconds / 60) * 100));
+
+  let timerMode = 'normal';
+  if (remainingSeconds <= 5) {
+    timerMode = 'urgent';
+  } else if (remainingSeconds <= 15) {
+    timerMode = 'warning';
+  }
+
+  if (!isRevealed) {
+    startTimerLoop(endTime, qIndex);
+  } else {
+    stopTimerLoop();
+  }
+
+  // Smooth in-place leaderboard update if the question and status did not change
+  const screen = document.querySelector('#screen');
+  const existingGrid = document.querySelector('.game-grid');
+  if (
+    existingGrid &&
+    renderedGameState.qIndex === qIndex &&
+    renderedGameState.questionStatus === data.questionStatus &&
+    renderedGameState.hasAnswered === hasAnswered &&
+    renderedGameState.score === (me.score || 0)
+  ) {
+    const rankList = document.querySelector('.rank-list');
+    if (rankList) {
+      rankList.innerHTML = ranking.map((p, i) => {
+        const pAns = p.answers && p.answers[qIndex];
+        const statusLabel = pAns
+          ? '<span style="color:var(--success); font-weight:600;">✓ Answered</span>'
+          : (isRevealed ? '<span style="color:var(--error);">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
+        return `
+          <div class="rank-item ${p.id === playerId ? 'is-me' : ''}">
+            <span class="rank-num">${i + 1}</span>
+            <div class="rank-details">
+              <span class="rank-name">
+                ${esc(p.name)}
+                ${p.id === playerId ? '<span class="you-tag">You</span>' : ''}
+              </span>
+              <span class="rank-prog">${statusLabel}</span>
+            </div>
+            <span class="rank-pts">${p.score || 0} pts</span>
+          </div>
+        `;
+      }).join('');
+    }
     return;
   }
 
-  const q = questions[qIndex];
-  const progressPercent = Math.round((qIndex / 10) * 100);
-  const ranking = [...players].sort((a, b) => (b.score || 0) - (a.score || 0));
+  renderedGameState = {
+    qIndex,
+    questionStatus: data.questionStatus || 'active',
+    hasAnswered,
+    score: me.score || 0
+  };
 
-  const screen = document.querySelector('#screen');
+  let feedbackHtml = '';
+  if (hasAnswered) {
+    if (myAnswer.correct) {
+      feedbackHtml = `
+        <div class="feedback-banner correct">
+          <span>✓ Correct! +1 point</span>
+          <span>Score: ${me.score || 0} / 10</span>
+        </div>
+      `;
+    } else if (myAnswer.timedOut) {
+      feedbackHtml = `
+        <div class="feedback-banner wrong">
+          <span>⏱️ Time expired! Correct answer was Option ${String.fromCharCode(65 + q[2])}.</span>
+          <span>Score: ${me.score || 0} / 10</span>
+        </div>
+      `;
+    } else {
+      feedbackHtml = `
+        <div class="feedback-banner wrong">
+          <span>✗ Incorrect. Correct answer was Option ${String.fromCharCode(65 + q[2])}.</span>
+          <span>Score: ${me.score || 0} / 10</span>
+        </div>
+      `;
+    }
+  } else if (isRevealed) {
+    feedbackHtml = `
+      <div class="feedback-banner wrong">
+        <span>⏱️ Time expired! Correct answer was Option ${String.fromCharCode(65 + q[2])}.</span>
+        <span>Score: ${me.score || 0} / 10</span>
+      </div>
+    `;
+  }
+
   screen.innerHTML = `
     <div class="game-grid">
       <!-- Main Quiz Card -->
       <div class="card quiz-card">
         <div class="quiz-top">
-          <span class="q-badge">Question ${qIndex + 1} of 10</span>
-          <span>Score: <strong>${me.score || 0} pts</strong></span>
+          <div class="quiz-top-left">
+            <span class="q-badge">Question ${qIndex + 1} of 10</span>
+            <div id="timer-pill" class="timer-pill ${isRevealed ? 'urgent' : timerMode}">
+              <span>⏱️</span>
+              <strong id="timer-text">${isRevealed ? 'Time Left: 0s' : `Time Left: ${remainingSeconds}s`}</strong>
+            </div>
+          </div>
+          <div>Score: <strong>${me.score || 0} pts</strong></div>
         </div>
 
-        <div class="progress-track">
-          <div class="progress-bar" style="width: ${progressPercent}%;"></div>
+        <div class="timer-track" role="progressbar" aria-valuenow="${isRevealed ? 0 : remainingSeconds}" aria-valuemin="0" aria-valuemax="60">
+          <div id="timer-bar" class="timer-bar ${isRevealed ? 'urgent' : timerMode}" style="width: ${isRevealed ? 0 : timerPercent}%;"></div>
         </div>
 
         <h2 class="question-text">${esc(q[0])}</h2>
@@ -957,15 +1113,20 @@ function renderGame(data, me) {
           ${q[1].map((answerText, idx) => {
             const letter = String.fromCharCode(65 + idx);
             let extraClass = '';
-            if (isAnswering && selectedChoice !== null) {
-              if (idx === selectedChoice) {
-                extraClass = idx === q[2] ? 'selected-correct' : 'selected-wrong';
+            if (hasAnswered) {
+              if (idx === myAnswer.choice) {
+                extraClass = myAnswer.correct ? 'selected-correct' : 'selected-wrong';
               } else if (idx === q[2]) {
                 extraClass = 'revealed-correct';
               }
+            } else if (isRevealed) {
+              if (idx === q[2]) {
+                extraClass = 'revealed-correct';
+              }
             }
+            const isBtnDisabled = hasAnswered || isRevealed || isAnswering;
             return `
-              <button class="answer-btn ${extraClass}" data-index="${idx}" ${isAnswering ? 'disabled' : ''} type="button">
+              <button class="answer-btn ${extraClass}" data-index="${idx}" ${isBtnDisabled ? 'disabled' : ''} type="button">
                 <span class="answer-letter">${letter}</span>
                 <span>${esc(answerText)}</span>
               </button>
@@ -973,7 +1134,16 @@ function renderGame(data, me) {
           }).join('')}
         </div>
 
-        <div id="feedback-area"></div>
+        <div id="feedback-area">
+          ${feedbackHtml}
+        </div>
+
+        ${isRevealed ? `
+          <div class="revealed-notice">
+            <span>⏳ Next question in 2 seconds...</span>
+            <span class="player-count-badge">Advancing</span>
+          </div>
+        ` : ''}
       </div>
 
       <!-- Live Leaderboard Sidebar -->
@@ -984,19 +1154,25 @@ function renderGame(data, me) {
         </h3>
 
         <div class="rank-list">
-          ${ranking.map((p, i) => `
-            <div class="rank-item ${p.id === playerId ? 'is-me' : ''}">
-              <span class="rank-num">${i + 1}</span>
-              <div class="rank-details">
-                <span class="rank-name">
-                  ${esc(p.name)}
-                  ${p.id === playerId ? '<span class="you-tag">You</span>' : ''}
-                </span>
-                <span class="rank-prog">${(p.question || 0) >= 10 ? '✓ Finished' : `Q ${(p.question || 0) + 1}/10`}</span>
+          ${ranking.map((p, i) => {
+            const pAns = p.answers && p.answers[qIndex];
+            const statusLabel = pAns
+              ? '<span style="color:var(--success); font-weight:600;">✓ Answered</span>'
+              : (isRevealed ? '<span style="color:var(--error);">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
+            return `
+              <div class="rank-item ${p.id === playerId ? 'is-me' : ''}">
+                <span class="rank-num">${i + 1}</span>
+                <div class="rank-details">
+                  <span class="rank-name">
+                    ${esc(p.name)}
+                    ${p.id === playerId ? '<span class="you-tag">You</span>' : ''}
+                  </span>
+                  <span class="rank-prog">${statusLabel}</span>
+                </div>
+                <span class="rank-pts">${p.score || 0} pts</span>
               </div>
-              <span class="rank-pts">${p.score || 0} pts</span>
-            </div>
-          `).join('')}
+            `;
+          }).join('')}
         </div>
 
         <div class="notice-box" style="margin-top:16px; font-size:12px; padding:10px 12px;">
@@ -1006,18 +1182,21 @@ function renderGame(data, me) {
     </div>
   `;
 
-  // Attach click handlers to answer buttons
-  document.querySelectorAll('.answer-btn').forEach((btn) => {
-    btn.onclick = () => {
-      const choice = Number(btn.dataset.index);
-      handleAnswerSelection(choice, q[2], qIndex, me, data);
-    };
-  });
+  // Attach click handlers to answer buttons if not already answered
+  if (!hasAnswered && !isRevealed) {
+    document.querySelectorAll('.answer-btn').forEach((btn) => {
+      btn.onclick = () => {
+        const choice = Number(btn.dataset.index);
+        handleAnswerSelection(choice, q[2], qIndex, me, data);
+      };
+    });
+  }
 }
 
 async function handleAnswerSelection(choice, correctIndex, qIndex, me, data) {
-  // Prevent double submissions or answering twice for the same question
-  if (isAnswering || lastAnsweredQuestion === qIndex || (me.question || 0) !== qIndex) {
+  // Prevent double submissions or answering when question is not active
+  const alreadyAnswered = Boolean(me.answers && me.answers[qIndex]);
+  if (isAnswering || alreadyAnswered || (data.currentQuestion ?? 0) !== qIndex || data.questionStatus !== 'active') {
     return;
   }
 
@@ -1027,7 +1206,6 @@ async function handleAnswerSelection(choice, correctIndex, qIndex, me, data) {
 
   const isCorrect = choice === correctIndex;
   const newScore = (me.score || 0) + (isCorrect ? 1 : 0);
-  const nextQ = qIndex + 1;
 
   // Immediate visual feedback on buttons
   const buttons = document.querySelectorAll('.answer-btn');
@@ -1059,87 +1237,45 @@ async function handleAnswerSelection(choice, correctIndex, qIndex, me, data) {
   // Synchronize state with Firebase Realtime Database
   try {
     const updates = {};
+    updates[`rooms/${room}/players/${playerId}/answers/${qIndex}`] = {
+      choice,
+      correct: isCorrect,
+      answeredAt: Date.now()
+    };
     if (isCorrect) {
       updates[`rooms/${room}/players/${playerId}/score`] = newScore;
     }
-    updates[`rooms/${room}/players/${playerId}/question`] = nextQ;
+    updates[`rooms/${room}/players/${playerId}/question`] = qIndex + 1;
     updates[`rooms/${room}/players/${playerId}/online`] = true;
 
-    // Check if this answer finishes the room for all players
+    // Check if ALL currently connected players have now answered this question
     const allPlayers = Object.values(data.players || {});
-    const willAllBeFinished = allPlayers.every(p => {
-      if (p.id === playerId) return nextQ >= 10;
-      return (p.question || 0) >= 10;
+    const onlinePlayers = allPlayers.filter(p => p.online !== false);
+    const activeList = onlinePlayers.length > 0 ? onlinePlayers : allPlayers;
+
+    const allHaveAnswered = activeList.every(p => {
+      if (p.id === playerId) return true;
+      return Boolean(p.answers && p.answers[qIndex]);
     });
 
-    if (willAllBeFinished) {
-      updates[`rooms/${room}/status`] = 'finished';
+    if (allHaveAnswered && data.questionStatus === 'active') {
+      updates[`rooms/${room}/questionStatus`] = 'revealed';
+      updates[`rooms/${room}/advanceTime`] = Date.now() + 2000;
     }
 
     await update(ref(db), updates);
   } catch (err) {
     console.warn('Error recording answer:', err);
-  }
-
-  // Smooth delay for feedback reading before advancing
-  setTimeout(() => {
+  } finally {
     isAnswering = false;
-    selectedChoice = null;
-  }, 1100);
+  }
 }
 
 // -------------------------------------------------------------
-// 10. Waiting for Other Players Screen
-// -------------------------------------------------------------
-function renderWaitingForOthers(data, me, players) {
-  const ranking = [...players].sort((a, b) => (b.score || 0) - (a.score || 0));
-  const finishedCount = players.filter(p => (p.question || 0) >= 10).length;
-
-  const screen = document.querySelector('#screen');
-  screen.innerHTML = `
-    <div class="game-grid">
-      <div class="card hero">
-        <h2>🎉 All 10 Questions Complete!</h2>
-        <p class="muted">
-          Your final score: <strong>${me.score || 0} / 10 (${Math.round(((me.score || 0) / 10) * 100)}%)</strong>
-        </p>
-
-        <div class="notice-box warning" style="margin-top:20px;">
-          ⏳ Waiting for other contestants to finish answering...
-          <div style="font-weight:700; margin-top:6px;">${finishedCount} of ${players.length} players completed</div>
-        </div>
-
-        <p class="muted" style="margin-top:16px;">
-          The victory podium and final rankings will appear automatically as soon as all players submit question 10.
-        </p>
-      </div>
-
-      <div class="card leaderboard-card">
-        <h3>Live Standings</h3>
-        <div class="rank-list">
-          ${ranking.map((p, i) => `
-            <div class="rank-item ${p.id === playerId ? 'is-me' : ''}">
-              <span class="rank-num">${i + 1}</span>
-              <div class="rank-details">
-                <span class="rank-name">
-                  ${esc(p.name)}
-                  ${p.id === playerId ? '<span class="you-tag">You</span>' : ''}
-                </span>
-                <span class="rank-prog">${(p.question || 0) >= 10 ? '✓ Finished' : `Q ${(p.question || 0) + 1}/10`}</span>
-              </div>
-              <span class="rank-pts">${p.score || 0} pts</span>
-            </div>
-          `).join('')}
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-// -------------------------------------------------------------
-// 11. Final Results Screen
+// 10. Final Results Screen
 // -------------------------------------------------------------
 function renderResults(data, me) {
+  stopTimerLoop();
   const players = Object.values(data.players || {});
   const sorted = [...players].sort((a, b) => (b.score || 0) - (a.score || 0));
 
@@ -1194,13 +1330,20 @@ function renderResults(data, me) {
   `;
 
   document.querySelector('#btn-rematch').onclick = async () => {
+    stopTimerLoop();
     // Reset room for a new match with the same players
     const updates = {
-      status: 'lobby'
+      status: 'lobby',
+      currentQuestion: 0,
+      questionStartTime: 0,
+      questionEndTime: 0,
+      questionStatus: 'idle',
+      advanceTime: 0
     };
     for (const p of players) {
       updates[`players/${p.id}/score`] = 0;
       updates[`players/${p.id}/question`] = 0;
+      updates[`players/${p.id}/answers`] = {};
     }
     await update(ref(db, `rooms/${room}`), updates);
   };
@@ -1209,7 +1352,7 @@ function renderResults(data, me) {
 }
 
 // -------------------------------------------------------------
-// 12. Initialization & Reconnection
+// 11. Initialization & Reconnection
 // -------------------------------------------------------------
 async function init() {
   renderHome();
