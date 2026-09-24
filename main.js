@@ -14,6 +14,15 @@ import {
   signInAnonymously,
   onAuthStateChanged
 } from 'firebase/auth';
+import {
+  QUESTION_BANK,
+  getQuestionById,
+  selectMatchQuestions
+} from './questions.js';
+
+// Authoritative Question Timer Configuration (Exactly 30 Seconds)
+const QUESTION_DURATION_SEC = 30;
+const QUESTION_DURATION_MS = 30000;
 
 // -------------------------------------------------------------
 // 1. Firebase Web Configuration
@@ -258,20 +267,16 @@ if (hasFirebase && db && !db.isMock) {
 }
 
 // -------------------------------------------------------------
-// 3. Quiz Data (10 Varied, Curated Questions)
+// 3. Match Question Resolver (Authoritative Shared 10 Questions)
 // -------------------------------------------------------------
-const questions = [
-  ['Which planet in our solar system is known as the Red Planet?', ['Venus', 'Mars', 'Jupiter', 'Mercury'], 1],
-  ['What is 15 × 12?', ['160', '170', '180', '190'], 2],
-  ['Which programming language runs natively in modern web browsers?', ['Python', 'Ruby', 'JavaScript', 'C#'], 2],
-  ['What is the largest ocean on Earth by surface area?', ['Atlantic Ocean', 'Indian Ocean', 'Arctic Ocean', 'Pacific Ocean'], 3],
-  ['What gas do green plants primarily absorb during photosynthesis?', ['Oxygen', 'Carbon Dioxide', 'Nitrogen', 'Helium'], 1],
-  ['How many sides does a regular hexagon have?', ['5', '6', '7', '8'], 1],
-  ['Who painted the famous masterpiece Mona Lisa?', ['Michelangelo', 'Leonardo da Vinci', 'Pablo Picasso', 'Vincent van Gogh'], 1],
-  ['What is the chemical formula for water?', ['CO2', 'NaCl', 'H2O', 'O2'], 2],
-  ['What is the largest continent on Earth by land area?', ['Africa', 'Asia', 'North America', 'Europe'], 1],
-  ['What is the capital city of Japan?', ['Kyoto', 'Osaka', 'Tokyo', 'Sapporo'], 2]
-];
+function getMatchQuestion(data, qIndex) {
+  if (data && Array.isArray(data.questionIds) && data.questionIds[qIndex]) {
+    const qObj = getQuestionById(data.questionIds[qIndex]);
+    if (qObj) return qObj;
+  }
+  // Safe fallback to guaranteed question bank item
+  return QUESTION_BANK[qIndex % QUESTION_BANK.length];
+}
 
 // -------------------------------------------------------------
 // 4. Session & State Management
@@ -660,6 +665,7 @@ async function handleCreateRoom() {
       status: 'lobby',
       createdAt: Date.now(),
       hostId: playerId,
+      questionIds: selectMatchQuestions(),
       currentQuestion: 0,
       questionStartTime: 0,
       questionEndTime: 0,
@@ -670,6 +676,7 @@ async function handleCreateRoom() {
           id: playerId,
           name,
           score: 0,
+          correctAnswers: 0,
           question: 0,
           answers: {},
           online: true,
@@ -748,6 +755,7 @@ async function handleJoinRoom() {
         id: playerId,
         name,
         score: existing.score || 0,
+        correctAnswers: existing.correctAnswers || 0,
         question: existing.question || 0,
         answers: existing.answers || {},
         online: true,
@@ -836,14 +844,9 @@ async function transitionQuestionToRevealed(expectedQIndex, delayMs = 2000) {
   isSettingRevealed = true;
   try {
     const roomPath = `rooms/${room}`;
-    await runTransaction(ref(db, roomPath), (current) => {
-      if (!current || current.status !== 'playing') return current;
-      if ((current.currentQuestion ?? 0) !== expectedQIndex) return current;
-      if (current.questionStatus === 'revealed' || current.questionStatus === 'completed') return current;
-
-      current.questionStatus = 'revealed';
-      current.advanceTime = Date.now() + delayMs;
-      return current;
+    await update(ref(db, roomPath), {
+      questionStatus: 'revealed',
+      advanceTime: Date.now() + delayMs
     });
   } catch (err) {
     console.warn('Error transitioning question to revealed:', err);
@@ -854,7 +857,7 @@ async function transitionQuestionToRevealed(expectedQIndex, delayMs = 2000) {
 
 /**
  * Atomically advances to the next question or finishes the match.
- * Uses atomic transaction so only ONE client ever increments currentQuestion.
+ * Updates authoritative room timing and progression without touching players object.
  */
 async function atomicallyAdvanceQuestion(expectedQIndex) {
   if (!room || isAdvancingQuestion) return;
@@ -864,32 +867,24 @@ async function atomicallyAdvanceQuestion(expectedQIndex) {
 
   isAdvancingQuestion = true;
   try {
-    const roomPath = `rooms/${room}`;
-    await runTransaction(ref(db, roomPath), (current) => {
-      if (!current || current.status !== 'playing') return current;
-      const q = current.currentQuestion ?? 0;
-      if (q !== expectedQIndex) return current; // Already advanced!
-
-      const isRevealed = current.questionStatus === 'revealed';
-      const isExpired = current.questionEndTime && Date.now() >= current.questionEndTime;
-      if (!isRevealed && !isExpired) return current;
-
-      const nextQ = expectedQIndex + 1;
-      const now = Date.now();
-      if (nextQ < 10) {
-        current.currentQuestion = nextQ;
-        current.questionStartTime = now;
-        current.questionEndTime = now + 60000;
-        current.questionStatus = 'active';
-        current.advanceTime = 0;
-      } else {
-        current.currentQuestion = 10;
-        current.status = 'finished';
-        current.questionStatus = 'completed';
-        current.advanceTime = 0;
-      }
-      return current;
-    });
+    const nextQ = expectedQIndex + 1;
+    const now = Date.now();
+    if (nextQ < 10) {
+      await update(ref(db, `rooms/${room}`), {
+        currentQuestion: nextQ,
+        questionStartTime: now,
+        questionEndTime: now + QUESTION_DURATION_MS,
+        questionStatus: 'active',
+        advanceTime: 0
+      });
+    } else {
+      await update(ref(db, `rooms/${room}`), {
+        currentQuestion: 10,
+        status: 'finished',
+        questionStatus: 'completed',
+        advanceTime: 0
+      });
+    }
   } catch (err) {
     console.warn('Error atomically advancing question:', err);
   } finally {
@@ -956,7 +951,7 @@ function startTimerLoop(endTime, qIndex) {
   function updateTimerDisplay() {
     const now = Date.now();
     const remainingSeconds = Math.max(0, Math.ceil((endTime - now) / 1000));
-    const percent = Math.max(0, Math.min(100, (remainingSeconds / 60) * 100));
+    const percent = Math.max(0, Math.min(100, (remainingSeconds / QUESTION_DURATION_SEC) * 100));
 
     const textEl = document.querySelector('#timer-text');
     const pillEl = document.querySelector('#timer-pill');
@@ -965,7 +960,7 @@ function startTimerLoop(endTime, qIndex) {
     let mode = 'normal';
     if (remainingSeconds <= 5) {
       mode = 'urgent';
-    } else if (remainingSeconds <= 15) {
+    } else if (remainingSeconds <= 10) {
       mode = 'warning';
     }
 
@@ -1047,7 +1042,7 @@ function renderRoom(data) {
 }
 
 // -------------------------------------------------------------
-// 9. In-Game Quiz Screen (Synchronized 60s Timer)
+// 9. In-Game Quiz Screen (Synchronized 30s Timer)
 // -------------------------------------------------------------
 function renderGame(data, me) {
   const players = Object.values(data.players || {});
@@ -1060,7 +1055,7 @@ function renderGame(data, me) {
     return;
   }
 
-  const q = questions[qIndex];
+  const q = getMatchQuestion(data, qIndex);
   const ranking = [...players].sort((a, b) => (b.score || 0) - (a.score || 0));
 
   const myAnswer = (me.answers && me.answers[qIndex]) || null;
@@ -1068,15 +1063,15 @@ function renderGame(data, me) {
   const isRevealed = data.questionStatus === 'revealed';
 
   const now = Date.now();
-  const endTime = data.questionEndTime || (now + 60000);
+  const endTime = data.questionEndTime || (now + QUESTION_DURATION_MS);
   const remainingSeconds = Math.max(0, Math.ceil((endTime - now) / 1000));
   const isTimedOut = remainingSeconds <= 0;
-  const timerPercent = Math.max(0, Math.min(100, (remainingSeconds / 60) * 100));
+  const timerPercent = Math.max(0, Math.min(100, (remainingSeconds / QUESTION_DURATION_SEC) * 100));
 
   let timerMode = 'normal';
   if (remainingSeconds <= 5) {
     timerMode = 'urgent';
-  } else if (remainingSeconds <= 15) {
+  } else if (remainingSeconds <= 10) {
     timerMode = 'warning';
   }
 
@@ -1092,10 +1087,11 @@ function renderGame(data, me) {
   if (
     existingGrid &&
     renderedGameState.qIndex === qIndex &&
-    renderedGameState.questionStatus === data.questionStatus &&
-    renderedGameState.hasAnswered === hasAnswered &&
-    renderedGameState.score === (me.score || 0)
+    renderedGameState.questionStatus === data.questionStatus
   ) {
+    renderedGameState.hasAnswered = hasAnswered;
+    renderedGameState.score = me.score || 0;
+
     const rankList = document.querySelector('.rank-list');
     if (rankList) {
       rankList.innerHTML = ranking.map((p, i) => {
@@ -1118,6 +1114,8 @@ function renderGame(data, me) {
         `;
       }).join('');
     }
+    const scoreHead = document.querySelector('#header-my-score');
+    if (scoreHead) scoreHead.textContent = `${me.score || 0} pts`;
     return;
   }
 
@@ -1140,7 +1138,7 @@ function renderGame(data, me) {
     } else {
       feedbackHtml = `
         <div class="feedback-banner wrong">
-          <span>✗ Incorrect. Correct answer was Option ${String.fromCharCode(65 + q[2])}.</span>
+          <span>✗ Incorrect. Correct answer was Option ${String.fromCharCode(65 + q.correctAnswer)}.</span>
           <span>Score: ${me.score || 0} / 10</span>
         </div>
       `;
@@ -1148,7 +1146,7 @@ function renderGame(data, me) {
   } else if (isRevealed || isTimedOut) {
     feedbackHtml = `
       <div class="feedback-banner wrong">
-        <span>⏱️ Time expired! Correct answer was Option ${String.fromCharCode(65 + q[2])}.</span>
+        <span>⏱️ Time expired! Correct answer was Option ${String.fromCharCode(65 + q.correctAnswer)}.</span>
         <span>Score: ${me.score || 0} / 10</span>
       </div>
     `;
@@ -1163,32 +1161,37 @@ function renderGame(data, me) {
         <div class="quiz-top">
           <div class="quiz-top-left">
             <span class="q-badge">Question ${qIndex + 1} of 10</span>
+            <span class="q-meta-badge">
+              <span>${esc(q.category)}</span>
+              •
+              <span class="q-diff-badge ${esc(q.difficulty.toLowerCase())}">${esc(q.difficulty)}</span>
+            </span>
             <div id="timer-pill" class="timer-pill ${isRevealed || isTimedOut ? 'urgent' : timerMode}">
               <span>⏱️</span>
               <strong id="timer-text">${isRevealed || isTimedOut ? 'Time Left: 0s' : `Time Left: ${remainingSeconds}s`}</strong>
             </div>
           </div>
-          <div>Score: <strong>${me.score || 0} pts</strong></div>
+          <div>Score: <strong id="header-my-score">${me.score || 0} pts</strong></div>
         </div>
 
-        <div class="timer-track" role="progressbar" aria-valuenow="${isRevealed || isTimedOut ? 0 : remainingSeconds}" aria-valuemin="0" aria-valuemax="60">
+        <div class="timer-track" role="progressbar" aria-valuenow="${isRevealed || isTimedOut ? 0 : remainingSeconds}" aria-valuemin="0" aria-valuemax="${QUESTION_DURATION_SEC}">
           <div id="timer-bar" class="timer-bar ${isRevealed || isTimedOut ? 'urgent' : timerMode}" style="width: ${isRevealed || isTimedOut ? 0 : timerPercent}%;"></div>
         </div>
 
-        <h2 class="question-text">${esc(q[0])}</h2>
+        <h2 class="question-text">${esc(q.question)}</h2>
 
         <div class="answers-grid" id="answers-container">
-          ${q[1].map((answerText, idx) => {
+          ${q.options.map((answerText, idx) => {
             const letter = String.fromCharCode(65 + idx);
             let extraClass = '';
             if (hasAnswered) {
               if (idx === myAnswer.choice) {
                 extraClass = myAnswer.correct ? 'selected-correct' : 'selected-wrong';
-              } else if (idx === q[2]) {
+              } else if (idx === q.correctAnswer) {
                 extraClass = 'revealed-correct';
               }
             } else if (isRevealed || isTimedOut) {
-              if (idx === q[2]) {
+              if (idx === q.correctAnswer) {
                 extraClass = 'revealed-correct';
               }
             }
@@ -1254,7 +1257,7 @@ function renderGame(data, me) {
     document.querySelectorAll('.answer-btn').forEach((btn) => {
       btn.onclick = () => {
         const choice = Number(btn.dataset.index);
-        handleAnswerSelection(choice, q[2], qIndex, me, data);
+        handleAnswerSelection(choice, q.correctAnswer, qIndex, me, data);
       };
     });
   }
@@ -1263,7 +1266,15 @@ function renderGame(data, me) {
 async function handleAnswerSelection(choice, correctIndex, qIndex, me, data) {
   // Prevent double submissions or answering when question is not active
   const alreadyAnswered = Boolean(me.answers && me.answers[qIndex]);
-  if (isAnswering || alreadyAnswered || (data.currentQuestion ?? 0) !== qIndex || data.questionStatus !== 'active') {
+  const now = Date.now();
+  const remainingSeconds = Math.max(0, Math.ceil(((data.questionEndTime || 0) - now) / 1000));
+  if (
+    isAnswering ||
+    alreadyAnswered ||
+    (data.currentQuestion ?? 0) !== qIndex ||
+    data.questionStatus !== 'active' ||
+    remainingSeconds <= 0
+  ) {
     return;
   }
 
@@ -1272,9 +1283,21 @@ async function handleAnswerSelection(choice, correctIndex, qIndex, me, data) {
   lastAnsweredQuestion = qIndex;
 
   const isCorrect = choice === correctIndex;
-  const newScore = (me.score || 0) + (isCorrect ? 1 : 0);
 
-  // Immediate visual feedback on buttons
+  // Initialize and record this answer in local memory
+  if (!me.answers) me.answers = {};
+  me.answers[qIndex] = {
+    choice,
+    correct: isCorrect,
+    answeredAt: now
+  };
+
+  // Derive score accurately from all recorded answers so far (prevents duplicate points or drift)
+  const currentTotalScore = Object.values(me.answers).filter(a => a && a.correct).length;
+  me.score = currentTotalScore;
+  me.correctAnswers = currentTotalScore;
+
+  // 1. Immediate visual feedback on buttons
   const buttons = document.querySelectorAll('.answer-btn');
   buttons.forEach((b) => {
     b.disabled = true;
@@ -1286,51 +1309,55 @@ async function handleAnswerSelection(choice, correctIndex, qIndex, me, data) {
     }
   });
 
+  const headerScore = document.querySelector('#header-my-score');
+  if (headerScore) {
+    headerScore.textContent = `${currentTotalScore} pts`;
+  }
+
   const feedbackArea = document.querySelector('#feedback-area');
   if (feedbackArea) {
     feedbackArea.innerHTML = isCorrect ? `
       <div class="feedback-banner correct">
         <span>✓ Correct! +1 point</span>
-        <span>Score: ${newScore} / 10</span>
+        <span>Score: ${currentTotalScore} / 10</span>
       </div>
     ` : `
       <div class="feedback-banner wrong">
         <span>✗ Incorrect. Correct answer was Option ${String.fromCharCode(65 + correctIndex)}.</span>
-        <span>Score: ${newScore} / 10</span>
+        <span>Score: ${currentTotalScore} / 10</span>
       </div>
     `;
   }
 
-  // Synchronize state with Firebase Realtime Database
+  // 2. Authoritative Atomic Persistence for this player in Firebase Realtime Database
   try {
-    const updates = {};
-    updates[`rooms/${room}/players/${playerId}/answers/${qIndex}`] = {
-      choice,
-      correct: isCorrect,
-      answeredAt: Date.now()
-    };
-    if (isCorrect) {
-      updates[`rooms/${room}/players/${playerId}/score`] = newScore;
-    }
-    updates[`rooms/${room}/players/${playerId}/question`] = qIndex + 1;
-    updates[`rooms/${room}/players/${playerId}/online`] = true;
+    const playerPath = `rooms/${room}/players/${playerId}`;
+    await update(ref(db, playerPath), {
+      score: currentTotalScore,
+      correctAnswers: currentTotalScore,
+      question: qIndex + 1,
+      online: true,
+      [`answers/${qIndex}`]: {
+        choice,
+        correct: isCorrect,
+        answeredAt: now
+      }
+    });
 
-    // Check if ALL currently connected players have now answered this question
-    const allPlayers = Object.values(data.players || {});
+    // 3. Early check if all online players in room have answered
+    const freshData = lastRoomData || data;
+    const allPlayers = Object.values(freshData.players || {});
     const onlinePlayers = allPlayers.filter(p => p.online !== false);
-    const activeList = onlinePlayers.length > 0 ? onlinePlayers : allPlayers;
+    const activePool = onlinePlayers.length > 0 ? onlinePlayers : allPlayers;
 
-    const allHaveAnswered = activeList.every(p => {
+    const allAnswered = activePool.length > 0 && activePool.every(p => {
       if (p.id === playerId) return true;
       return Boolean(p.answers && p.answers[qIndex]);
     });
 
-    if (allHaveAnswered && data.questionStatus === 'active') {
-      updates[`rooms/${room}/questionStatus`] = 'revealed';
-      updates[`rooms/${room}/advanceTime`] = Date.now() + 2000;
+    if (allAnswered && (lastRoomData?.questionStatus === 'active' || data.questionStatus === 'active')) {
+      await transitionQuestionToRevealed(qIndex, 2000);
     }
-
-    await update(ref(db), updates);
   } catch (err) {
     console.warn('Error recording answer:', err);
   } finally {
@@ -1398,17 +1425,19 @@ function renderResults(data, me) {
 
   document.querySelector('#btn-rematch').onclick = async () => {
     stopTimerLoop();
-    // Reset room for a new match with the same players
+    // Reset room for a new match with the same players and fresh unique questions
     const updates = {
       status: 'lobby',
       currentQuestion: 0,
       questionStartTime: 0,
       questionEndTime: 0,
       questionStatus: 'idle',
-      advanceTime: 0
+      advanceTime: 0,
+      questionIds: selectMatchQuestions()
     };
     for (const p of players) {
       updates[`players/${p.id}/score`] = 0;
+      updates[`players/${p.id}/correctAnswers`] = 0;
       updates[`players/${p.id}/question`] = 0;
       updates[`players/${p.id}/answers`] = {};
     }
@@ -1507,13 +1536,17 @@ function renderLobby(data, me, players) {
         startedAt: now,
         currentQuestion: 0,
         questionStartTime: now,
-        questionEndTime: now + 60000,
+        questionEndTime: now + QUESTION_DURATION_MS,
         questionStatus: 'active',
         advanceTime: 0
       };
+      if (!data.questionIds || data.questionIds.length < 10) {
+        updates.questionIds = selectMatchQuestions();
+      }
       // Reset all players scores, question index to 0, and clear answers
       for (const p of players) {
         updates[`players/${p.id}/score`] = 0;
+        updates[`players/${p.id}/correctAnswers`] = 0;
         updates[`players/${p.id}/question`] = 0;
         updates[`players/${p.id}/answers`] = {};
       }
