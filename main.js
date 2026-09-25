@@ -517,12 +517,21 @@ function shell() {
       <header>
         <div class="header-left">
           <div class="header-title-row">
+            <div class="brand-emblem" aria-hidden="true">⚔️</div>
             <h1>Quiz Battle Arena</h1>
             <div id="connection-status" class="status-pill ${statusClass}">
               <span class="status-dot"></span> ${statusText}
             </div>
           </div>
-          <div class="header-desc">2–4 players · 10 questions · Live multiplayer quiz showdown</div>
+          <div class="header-desc">
+            <span>2–4 Players</span>
+            <span class="header-desc-dot">·</span>
+            <span>10 Questions</span>
+            <span class="header-desc-dot">·</span>
+            <span>30s Countdown</span>
+            <span class="header-desc-dot">·</span>
+            <span>Live Multiplayer</span>
+          </div>
         </div>
       </header>
       <section id="screen"></section>
@@ -545,8 +554,23 @@ function renderHome(errorMessage = '') {
   const screen = document.querySelector('#screen');
   screen.innerHTML = `
     <div class="card hero">
+      <div class="spec-banner" aria-label="Game Specifications">
+        <div class="spec-item">
+          <span class="spec-val">👥 2–4</span>
+          <span class="spec-label">Players</span>
+        </div>
+        <div class="spec-item">
+          <span class="spec-val">🎯 10</span>
+          <span class="spec-label">Questions</span>
+        </div>
+        <div class="spec-item">
+          <span class="spec-val">⏱️ 30s</span>
+          <span class="spec-label">Per Round</span>
+        </div>
+      </div>
+
       <h2>Join the Arena</h2>
-      <p class="muted">Play live trivia battles with friends across different devices or tabs.</p>
+      <p class="muted">Play live trivia battles with friends across different devices or browser tabs.</p>
 
       ${errorMessage ? `<div class="notice-box error">${esc(errorMessage)}</div>` : ''}
 
@@ -581,13 +605,14 @@ function renderHome(errorMessage = '') {
       </div>
 
       <div class="notice-box" style="margin-top:24px;">
-        <strong style="display:block; margin-bottom:6px; color:var(--text);">🎮 Battle Rules:</strong>
-        <ul style="padding-left:18px; margin:0; line-height:1.6;">
-          <li>Supports 2 to 4 players per room.</li>
-          <li>Every player receives the same 10 multiple-choice questions.</li>
-          <li>Each correct answer earns 1 point.</li>
-          <li>Scores update live on the real-time leaderboard.</li>
-          <li>The player with the highest score after 10 questions wins!</li>
+        <strong style="display:block; margin-bottom:8px; color:#ffffff;">🎮 Battle Arena Rules:</strong>
+        <ul style="padding-left:18px; margin:0; line-height:1.65; color:var(--text-secondary);">
+          <li>Supports 2 to 4 players per room in real-time.</li>
+          <li>Every player receives the same 10 curated multiple-choice questions.</li>
+          <li>Authoritative synchronized 30-second countdown per question.</li>
+          <li>Each correct answer immediately awards 1 point.</li>
+          <li>Live standings update dynamically on all contestants' screens.</li>
+          <li>The contender with the highest score after 10 questions wins!</li>
         </ul>
       </div>
     </div>
@@ -1094,14 +1119,16 @@ function renderGame(data, me) {
 
     const rankList = document.querySelector('.rank-list');
     if (rankList) {
+      const medals = ['🥇', '🥈', '🥉', '4'];
       rankList.innerHTML = ranking.map((p, i) => {
         const pAns = p.answers && p.answers[qIndex];
         const statusLabel = pAns
-          ? '<span style="color:var(--success); font-weight:600;">✓ Answered</span>'
-          : (isRevealed || isTimedOut ? '<span style="color:var(--error);">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
+          ? '<span style="color:var(--success); font-weight:700;">✓ Answered</span>'
+          : (isRevealed || isTimedOut ? '<span style="color:var(--error); font-weight:600;">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
+        const medalOrNum = i < 3 ? medals[i] : `${i + 1}`;
         return `
           <div class="rank-item ${p.id === playerId ? 'is-me' : ''}">
-            <span class="rank-num">${i + 1}</span>
+            <span class="rank-num" title="Rank ${i + 1}">${medalOrNum}</span>
             <div class="rank-details">
               <span class="rank-name">
                 ${esc(p.name)}
@@ -1225,13 +1252,15 @@ function renderGame(data, me) {
 
         <div class="rank-list">
           ${ranking.map((p, i) => {
+            const medals = ['🥇', '🥈', '🥉', '4'];
+            const medalOrNum = i < 3 ? medals[i] : `${i + 1}`;
             const pAns = p.answers && p.answers[qIndex];
             const statusLabel = pAns
-              ? '<span style="color:var(--success); font-weight:600;">✓ Answered</span>'
-              : (isRevealed || isTimedOut ? '<span style="color:var(--error);">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
+              ? '<span style="color:var(--success); font-weight:700;">✓ Answered</span>'
+              : (isRevealed || isTimedOut ? '<span style="color:var(--error); font-weight:600;">⏱️ Timed out</span>' : '<span style="color:var(--text-muted);">⏳ Thinking...</span>');
             return `
               <div class="rank-item ${p.id === playerId ? 'is-me' : ''}">
-                <span class="rank-num">${i + 1}</span>
+                <span class="rank-num" title="Rank ${i + 1}">${medalOrNum}</span>
                 <div class="rank-details">
                   <span class="rank-name">
                     ${esc(p.name)}
